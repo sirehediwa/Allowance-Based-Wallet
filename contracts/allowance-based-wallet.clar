@@ -6,6 +6,10 @@
 (define-constant ERR_INVALID_AMOUNT (err u105))
 (define-constant ERR_SELF_APPROVAL (err u106))
 (define-constant ERR_ALREADY_INITIALIZED (err u107))
+(define-constant ERR_PAYMENT_NOT_FOUND (err u108))
+(define-constant ERR_PAYMENT_NOT_DUE (err u109))
+(define-constant ERR_PAYMENT_EXPIRED (err u110))
+(define-constant ERR_INVALID_INTERVAL (err u111))
 
 (define-data-var contract-owner principal tx-sender)
 
@@ -35,6 +39,24 @@
     transaction-count: uint
   }
 )
+
+(define-map scheduled-payments
+  { 
+    payment-id: uint,
+    payer: principal
+  }
+  {
+    recipient: principal,
+    amount: uint,
+    interval-blocks: uint,
+    next-payment-block: uint,
+    remaining-payments: uint,
+    is-active: bool,
+    created-at: uint
+  }
+)
+
+(define-data-var payment-id-counter uint u0)
 
 (define-read-only (get-contract-owner)
   (var-get contract-owner)
@@ -78,6 +100,17 @@
     wallet (ok (get is-active wallet))
     (ok false)
   )
+)
+
+(define-read-only (get-scheduled-payment (payment-id uint) (payer principal))
+  (match (map-get? scheduled-payments { payment-id: payment-id, payer: payer })
+    payment (ok payment)
+    (err ERR_PAYMENT_NOT_FOUND)
+  )
+)
+
+(define-read-only (get-next-payment-id)
+  (ok (+ (var-get payment-id-counter) u1))
 )
 
 (define-public (create-wallet)
@@ -285,5 +318,113 @@
   )
     (asserts! (> current-balance u0) ERR_INSUFFICIENT_BALANCE)
     (withdraw current-balance)
+  )
+)
+
+(define-public (create-scheduled-payment (recipient principal) (amount uint) (interval-blocks uint) (total-payments uint))
+  (let (
+    (caller tx-sender)
+    (current-wallet (unwrap! (map-get? wallets { owner: caller }) ERR_WALLET_NOT_FOUND))
+    (payment-id (+ (var-get payment-id-counter) u1))
+    (current-metadata (unwrap! (map-get? wallet-metadata { owner: caller }) ERR_WALLET_NOT_FOUND))
+  )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> interval-blocks u0) ERR_INVALID_INTERVAL)
+    (asserts! (> total-payments u0) ERR_INVALID_AMOUNT)
+    (asserts! (not (is-eq caller recipient)) ERR_SELF_APPROVAL)
+    (asserts! (get is-active current-wallet) ERR_UNAUTHORIZED)
+    (asserts! (>= (get balance current-wallet) (* amount total-payments)) ERR_INSUFFICIENT_BALANCE)
+    
+    (var-set payment-id-counter payment-id)
+    (map-set scheduled-payments
+      { payment-id: payment-id, payer: caller }
+      {
+        recipient: recipient,
+        amount: amount,
+        interval-blocks: interval-blocks,
+        next-payment-block: (+ stacks-block-height interval-blocks),
+        remaining-payments: total-payments,
+        is-active: true,
+        created-at: stacks-block-height
+      }
+    )
+    (map-set wallet-metadata
+      { owner: caller }
+      (merge current-metadata { 
+        transaction-count: (+ (get transaction-count current-metadata) u1)
+      })
+    )
+    (ok payment-id)
+  )
+)
+
+(define-public (execute-scheduled-payment (payment-id uint) (payer principal))
+  (let (
+    (payment (unwrap! (map-get? scheduled-payments { payment-id: payment-id, payer: payer }) ERR_PAYMENT_NOT_FOUND))
+    (payer-wallet (unwrap! (map-get? wallets { owner: payer }) ERR_WALLET_NOT_FOUND))
+    (recipient-address (get recipient payment))
+    (payment-amount (get amount payment))
+    (current-block stacks-block-height)
+  )
+    (asserts! (get is-active payment) ERR_PAYMENT_EXPIRED)
+    (asserts! (>= current-block (get next-payment-block payment)) ERR_PAYMENT_NOT_DUE)
+    (asserts! (> (get remaining-payments payment) u0) ERR_PAYMENT_EXPIRED)
+    (asserts! (>= (get balance payer-wallet) payment-amount) ERR_INSUFFICIENT_BALANCE)
+    
+    (if (is-none (map-get? wallets { owner: recipient-address }))
+      (map-set wallets 
+        { owner: recipient-address }
+        { 
+          balance: payment-amount, 
+          created-at: current-block,
+          is-active: true
+        }
+      )
+      (let ((recipient-wallet (unwrap-panic (map-get? wallets { owner: recipient-address }))))
+        (map-set wallets
+          { owner: recipient-address }
+          (merge recipient-wallet { balance: (+ (get balance recipient-wallet) payment-amount) })
+        )
+      )
+    )
+    
+    (map-set wallets
+      { owner: payer }
+      (merge payer-wallet { balance: (- (get balance payer-wallet) payment-amount) })
+    )
+    
+    (let ((updated-remaining (- (get remaining-payments payment) u1)))
+      (if (> updated-remaining u0)
+        (map-set scheduled-payments
+          { payment-id: payment-id, payer: payer }
+          (merge payment {
+            next-payment-block: (+ current-block (get interval-blocks payment)),
+            remaining-payments: updated-remaining
+          })
+        )
+        (map-set scheduled-payments
+          { payment-id: payment-id, payer: payer }
+          (merge payment {
+            remaining-payments: u0,
+            is-active: false
+          })
+        )
+      )
+    )
+    (ok payment-amount)
+  )
+)
+
+(define-public (cancel-scheduled-payment (payment-id uint))
+  (let (
+    (caller tx-sender)
+    (payment (unwrap! (map-get? scheduled-payments { payment-id: payment-id, payer: caller }) ERR_PAYMENT_NOT_FOUND))
+  )
+    (asserts! (get is-active payment) ERR_PAYMENT_EXPIRED)
+    (map-set scheduled-payments
+      { payment-id: payment-id, payer: caller }
+      (merge payment { is-active: false })
+    )
+    (ok true)
   )
 )
