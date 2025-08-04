@@ -10,6 +10,9 @@
 (define-constant ERR_PAYMENT_NOT_DUE (err u109))
 (define-constant ERR_PAYMENT_EXPIRED (err u110))
 (define-constant ERR_INVALID_INTERVAL (err u111))
+(define-constant ERR_BATCH_EMPTY (err u112))
+(define-constant ERR_BATCH_TOO_LARGE (err u113))
+(define-constant ERR_INVALID_OPERATION (err u114))
 
 (define-data-var contract-owner principal tx-sender)
 
@@ -57,6 +60,7 @@
 )
 
 (define-data-var payment-id-counter uint u0)
+(define-data-var max-batch-size uint u10)
 
 (define-read-only (get-contract-owner)
   (var-get contract-owner)
@@ -426,5 +430,95 @@
       (merge payment { is-active: false })
     )
     (ok true)
+  )
+)
+
+(define-private (execute-batch-operation (operation { op-type: (string-ascii 20), recipient: (optional principal), amount: uint, spender: (optional principal) }))
+  (let (
+    (op-type (get op-type operation))
+    (amount (get amount operation))
+    (recipient (get recipient operation))
+    (spender (get spender operation))
+  )
+    (if (is-eq op-type "deposit")
+      (deposit amount)
+      (if (is-eq op-type "withdraw")
+        (withdraw amount)
+        (if (is-eq op-type "approve")
+          (match spender
+            spender-addr (approve spender-addr amount)
+            ERR_INVALID_OPERATION
+          )
+          (if (is-eq op-type "transfer")
+            (match recipient
+              recipient-addr (transfer-from tx-sender recipient-addr amount)
+              ERR_INVALID_OPERATION
+            )
+            ERR_INVALID_OPERATION
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-public (batch-execute (operations (list 10 { op-type: (string-ascii 20), recipient: (optional principal), amount: uint, spender: (optional principal) })))
+  (let (
+    (batch-length (len operations))
+  )
+    (asserts! (> batch-length u0) ERR_BATCH_EMPTY)
+    (asserts! (<= batch-length (var-get max-batch-size)) ERR_BATCH_TOO_LARGE)
+    (asserts! (is-some (map-get? wallets { owner: tx-sender })) ERR_WALLET_NOT_FOUND)
+    (match (fold check-and-execute operations (ok u0))
+      success (ok true)
+      error (err error)
+    )
+  )
+)
+
+(define-private (check-and-execute (operation { op-type: (string-ascii 20), recipient: (optional principal), amount: uint, spender: (optional principal) }) (previous-result (response uint uint)))
+  (match previous-result
+    success (match (execute-batch-operation operation)
+      op-success (ok success)
+      op-error (err op-error)
+    )
+    error (err error)
+  )
+)
+
+(define-public (batch-deposit-and-approve (deposit-amount uint) (spender principal) (approve-amount uint))
+  (begin
+    (try! (deposit deposit-amount))
+    (approve spender approve-amount)
+  )
+)
+
+(define-public (batch-withdraw-and-transfer (withdraw-amount uint) (recipient principal) (transfer-amount uint))
+  (begin
+    (try! (withdraw withdraw-amount))
+    (transfer-from tx-sender recipient transfer-amount)
+  )
+)
+
+(define-public (batch-multiple-approvals (approvals (list 5 { spender: principal, amount: uint })))
+  (let (
+    (batch-length (len approvals))
+  )
+    (asserts! (> batch-length u0) ERR_BATCH_EMPTY)
+    (asserts! (is-some (map-get? wallets { owner: tx-sender })) ERR_WALLET_NOT_FOUND)
+    (match (fold process-approval approvals (ok u0))
+      success (ok true)
+      error (err error)
+    )
+  )
+)
+
+(define-private (process-approval (approval { spender: principal, amount: uint }) (previous-result (response uint uint)))
+  (match previous-result
+    success (match (approve (get spender approval) (get amount approval))
+      approval-success (ok success)
+      approval-error (err approval-error)
+    )
+    error (err error)
   )
 )
