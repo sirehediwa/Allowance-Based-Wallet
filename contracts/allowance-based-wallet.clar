@@ -13,6 +13,9 @@
 (define-constant ERR_BATCH_EMPTY (err u112))
 (define-constant ERR_BATCH_TOO_LARGE (err u113))
 (define-constant ERR_INVALID_OPERATION (err u114))
+(define-constant ERR_SPENDING_LIMIT_EXCEEDED (err u115))
+(define-constant ERR_LIMIT_NOT_FOUND (err u116))
+(define-constant ERR_INVALID_TIME_WINDOW (err u117))
 
 (define-data-var contract-owner principal tx-sender)
 
@@ -61,6 +64,20 @@
 
 (define-data-var payment-id-counter uint u0)
 (define-data-var max-batch-size uint u10)
+
+(define-map spending-limits
+  {
+    owner: principal,
+    limit-type: (string-ascii 10)
+  }
+  {
+    limit-amount: uint,
+    window-blocks: uint,
+    spent-amount: uint,
+    window-start-block: uint,
+    is-active: bool
+  }
+)
 
 (define-read-only (get-contract-owner)
   (var-get contract-owner)
@@ -115,6 +132,34 @@
 
 (define-read-only (get-next-payment-id)
   (ok (+ (var-get payment-id-counter) u1))
+)
+
+(define-read-only (get-spending-limit (owner principal) (limit-type (string-ascii 10)))
+  (match (map-get? spending-limits { owner: owner, limit-type: limit-type })
+    limit (ok limit)
+    (err ERR_LIMIT_NOT_FOUND)
+  )
+)
+
+(define-read-only (get-remaining-spending-limit (owner principal) (limit-type (string-ascii 10)))
+  (match (map-get? spending-limits { owner: owner, limit-type: limit-type })
+    limit 
+    (let (
+      (current-block stacks-block-height)
+      (window-start (get window-start-block limit))
+      (window-blocks (get window-blocks limit))
+      (spent-amount (get spent-amount limit))
+      (limit-amount (get limit-amount limit))
+    )
+      (if (>= (- current-block window-start) window-blocks)
+        (ok limit-amount)
+        (ok (if (>= limit-amount spent-amount) 
+          (- limit-amount spent-amount) 
+          u0))
+      )
+    )
+    (ok u0)
+  )
 )
 
 (define-public (create-wallet)
@@ -175,7 +220,9 @@
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     (asserts! (get is-active current-wallet) ERR_UNAUTHORIZED)
     (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
+    (try! (check-spending-limit caller amount))
     (try! (as-contract (stx-transfer? amount tx-sender caller)))
+    (unwrap-panic (update-spending-tracking caller amount))
     (map-set wallets
       { owner: caller }
       (merge current-wallet { balance: (- current-balance amount) })
@@ -520,5 +567,142 @@
       approval-error (err approval-error)
     )
     error (err error)
+  )
+)
+
+(define-private (check-spending-limit (owner principal) (amount uint))
+  (let (
+    (daily-limit (map-get? spending-limits { owner: owner, limit-type: "daily" }))
+    (weekly-limit (map-get? spending-limits { owner: owner, limit-type: "weekly" }))
+    (monthly-limit (map-get? spending-limits { owner: owner, limit-type: "monthly" }))
+    (current-block stacks-block-height)
+  )
+    (match daily-limit
+      limit (if (get is-active limit)
+        (let (
+          (window-start (get window-start-block limit))
+          (window-blocks (get window-blocks limit))
+          (spent-amount (get spent-amount limit))
+          (limit-amount (get limit-amount limit))
+          (current-spent (if (>= (- current-block window-start) window-blocks) u0 spent-amount))
+        )
+          (asserts! (<= (+ current-spent amount) limit-amount) ERR_SPENDING_LIMIT_EXCEEDED)
+          (ok true)
+        )
+        (ok true)
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-private (update-spending-tracking (owner principal) (amount uint))
+  (let (
+    (current-block stacks-block-height)
+  )
+    (match (map-get? spending-limits { owner: owner, limit-type: "daily" })
+      daily-limit 
+      (if (get is-active daily-limit)
+        (let (
+          (window-start (get window-start-block daily-limit))
+          (window-blocks (get window-blocks daily-limit))
+          (spent-amount (get spent-amount daily-limit))
+          (is-new-window (>= (- current-block window-start) window-blocks))
+        )
+          (begin
+            (map-set spending-limits
+              { owner: owner, limit-type: "daily" }
+              (merge daily-limit {
+                spent-amount: (if is-new-window amount (+ spent-amount amount)),
+                window-start-block: (if is-new-window current-block window-start)
+              })
+            )
+            (ok true)
+          )
+        )
+        (ok true)
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (set-spending-limit (limit-type (string-ascii 10)) (limit-amount uint) (window-blocks uint))
+  (let (
+    (caller tx-sender)
+    (current-wallet (unwrap! (map-get? wallets { owner: caller }) ERR_WALLET_NOT_FOUND))
+  )
+    (asserts! (> limit-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> window-blocks u0) ERR_INVALID_TIME_WINDOW)
+    (asserts! (get is-active current-wallet) ERR_UNAUTHORIZED)
+    (asserts! (or (is-eq limit-type "daily") (or (is-eq limit-type "weekly") (is-eq limit-type "monthly"))) ERR_INVALID_OPERATION)
+    (map-set spending-limits
+      { owner: caller, limit-type: limit-type }
+      {
+        limit-amount: limit-amount,
+        window-blocks: window-blocks,
+        spent-amount: u0,
+        window-start-block: stacks-block-height,
+        is-active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-spending-limit (limit-type (string-ascii 10)) (new-limit-amount uint))
+  (let (
+    (caller tx-sender)
+    (current-limit (unwrap! (map-get? spending-limits { owner: caller, limit-type: limit-type }) ERR_LIMIT_NOT_FOUND))
+  )
+    (asserts! (> new-limit-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (get is-active current-limit) ERR_LIMIT_NOT_FOUND)
+    (map-set spending-limits
+      { owner: caller, limit-type: limit-type }
+      (merge current-limit { limit-amount: new-limit-amount })
+    )
+    (ok true)
+  )
+)
+
+(define-public (disable-spending-limit (limit-type (string-ascii 10)))
+  (let (
+    (caller tx-sender)
+    (current-limit (unwrap! (map-get? spending-limits { owner: caller, limit-type: limit-type }) ERR_LIMIT_NOT_FOUND))
+  )
+    (map-set spending-limits
+      { owner: caller, limit-type: limit-type }
+      (merge current-limit { is-active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (enable-spending-limit (limit-type (string-ascii 10)))
+  (let (
+    (caller tx-sender)
+    (current-limit (unwrap! (map-get? spending-limits { owner: caller, limit-type: limit-type }) ERR_LIMIT_NOT_FOUND))
+  )
+    (map-set spending-limits
+      { owner: caller, limit-type: limit-type }
+      (merge current-limit { is-active: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (reset-spending-window (limit-type (string-ascii 10)))
+  (let (
+    (caller tx-sender)
+    (current-limit (unwrap! (map-get? spending-limits { owner: caller, limit-type: limit-type }) ERR_LIMIT_NOT_FOUND))
+  )
+    (map-set spending-limits
+      { owner: caller, limit-type: limit-type }
+      (merge current-limit { 
+        spent-amount: u0,
+        window-start-block: stacks-block-height
+      })
+    )
+    (ok true)
   )
 )
