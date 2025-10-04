@@ -16,6 +16,10 @@
 (define-constant ERR_SPENDING_LIMIT_EXCEEDED (err u115))
 (define-constant ERR_LIMIT_NOT_FOUND (err u116))
 (define-constant ERR_INVALID_TIME_WINDOW (err u117))
+(define-constant ERR_VAULT_NOT_FOUND (err u118))
+(define-constant ERR_VAULT_LOCKED (err u119))
+(define-constant ERR_VAULT_EXISTS (err u120))
+(define-constant ERR_INSUFFICIENT_VAULT_BALANCE (err u121))
 
 (define-data-var contract-owner principal tx-sender)
 
@@ -78,6 +82,22 @@
     is-active: bool
   }
 )
+
+(define-map savings-vaults
+  {
+    owner: principal,
+    vault-name: (string-ascii 50)
+  }
+  {
+    balance: uint,
+    target-amount: uint,
+    unlock-block: uint,
+    is-locked: bool,
+    created-at: uint
+  }
+)
+
+(define-data-var vault-counter uint u0)
 
 (define-read-only (get-contract-owner)
   (var-get contract-owner)
@@ -159,6 +179,38 @@
       )
     )
     (ok u0)
+  )
+)
+
+(define-read-only (get-vault (owner principal) (vault-name (string-ascii 50)))
+  (match (map-get? savings-vaults { owner: owner, vault-name: vault-name })
+    vault (ok vault)
+    (err ERR_VAULT_NOT_FOUND)
+  )
+)
+
+(define-read-only (get-vault-progress (owner principal) (vault-name (string-ascii 50)))
+  (match (map-get? savings-vaults { owner: owner, vault-name: vault-name })
+    vault (ok {
+      balance: (get balance vault),
+      target: (get target-amount vault),
+      percentage: (if (> (get target-amount vault) u0)
+        (/ (* (get balance vault) u100) (get target-amount vault))
+        u0
+      ),
+      goal-reached: (>= (get balance vault) (get target-amount vault))
+    })
+    (err ERR_VAULT_NOT_FOUND)
+  )
+)
+
+(define-read-only (is-vault-unlocked (owner principal) (vault-name (string-ascii 50)))
+  (match (map-get? savings-vaults { owner: owner, vault-name: vault-name })
+    vault (ok (or 
+      (not (get is-locked vault))
+      (>= stacks-block-height (get unlock-block vault))
+    ))
+    (err ERR_VAULT_NOT_FOUND)
   )
 )
 
@@ -704,5 +756,126 @@
       })
     )
     (ok true)
+  )
+)
+
+(define-public (create-vault (vault-name (string-ascii 50)) (target-amount uint) (lock-blocks uint))
+  (let (
+    (caller tx-sender)
+    (current-wallet (unwrap! (map-get? wallets { owner: caller }) ERR_WALLET_NOT_FOUND))
+  )
+    (asserts! (is-none (map-get? savings-vaults { owner: caller, vault-name: vault-name })) ERR_VAULT_EXISTS)
+    (asserts! (> target-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (get is-active current-wallet) ERR_UNAUTHORIZED)
+    (map-set savings-vaults
+      { owner: caller, vault-name: vault-name }
+      {
+        balance: u0,
+        target-amount: target-amount,
+        unlock-block: (+ stacks-block-height lock-blocks),
+        is-locked: (> lock-blocks u0),
+        created-at: stacks-block-height
+      }
+    )
+    (var-set vault-counter (+ (var-get vault-counter) u1))
+    (ok vault-name)
+  )
+)
+
+(define-public (deposit-to-vault (vault-name (string-ascii 50)) (amount uint))
+  (let (
+    (caller tx-sender)
+    (current-wallet (unwrap! (map-get? wallets { owner: caller }) ERR_WALLET_NOT_FOUND))
+    (vault (unwrap! (map-get? savings-vaults { owner: caller, vault-name: vault-name }) ERR_VAULT_NOT_FOUND))
+    (current-balance (get balance current-wallet))
+  )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (get is-active current-wallet) ERR_UNAUTHORIZED)
+    (map-set wallets
+      { owner: caller }
+      (merge current-wallet { balance: (- current-balance amount) })
+    )
+    (map-set savings-vaults
+      { owner: caller, vault-name: vault-name }
+      (merge vault { balance: (+ (get balance vault) amount) })
+    )
+    (ok amount)
+  )
+)
+
+(define-public (withdraw-from-vault (vault-name (string-ascii 50)) (amount uint))
+  (let (
+    (caller tx-sender)
+    (current-wallet (unwrap! (map-get? wallets { owner: caller }) ERR_WALLET_NOT_FOUND))
+    (vault (unwrap! (map-get? savings-vaults { owner: caller, vault-name: vault-name }) ERR_VAULT_NOT_FOUND))
+    (vault-balance (get balance vault))
+    (is-unlocked (or (not (get is-locked vault)) (>= stacks-block-height (get unlock-block vault))))
+  )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! is-unlocked ERR_VAULT_LOCKED)
+    (asserts! (>= vault-balance amount) ERR_INSUFFICIENT_VAULT_BALANCE)
+    (asserts! (get is-active current-wallet) ERR_UNAUTHORIZED)
+    (map-set savings-vaults
+      { owner: caller, vault-name: vault-name }
+      (merge vault { balance: (- vault-balance amount) })
+    )
+    (map-set wallets
+      { owner: caller }
+      (merge current-wallet { balance: (+ (get balance current-wallet) amount) })
+    )
+    (ok amount)
+  )
+)
+
+(define-public (close-vault (vault-name (string-ascii 50)))
+  (let (
+    (caller tx-sender)
+    (current-wallet (unwrap! (map-get? wallets { owner: caller }) ERR_WALLET_NOT_FOUND))
+    (vault (unwrap! (map-get? savings-vaults { owner: caller, vault-name: vault-name }) ERR_VAULT_NOT_FOUND))
+    (vault-balance (get balance vault))
+    (is-unlocked (or (not (get is-locked vault)) (>= stacks-block-height (get unlock-block vault))))
+  )
+    (asserts! is-unlocked ERR_VAULT_LOCKED)
+    (asserts! (get is-active current-wallet) ERR_UNAUTHORIZED)
+    (if (> vault-balance u0)
+      (map-set wallets
+        { owner: caller }
+        (merge current-wallet { balance: (+ (get balance current-wallet) vault-balance) })
+      )
+      true
+    )
+    (map-delete savings-vaults { owner: caller, vault-name: vault-name })
+    (ok vault-balance)
+  )
+)
+
+(define-public (update-vault-target (vault-name (string-ascii 50)) (new-target uint))
+  (let (
+    (caller tx-sender)
+    (vault (unwrap! (map-get? savings-vaults { owner: caller, vault-name: vault-name }) ERR_VAULT_NOT_FOUND))
+  )
+    (asserts! (> new-target u0) ERR_INVALID_AMOUNT)
+    (map-set savings-vaults
+      { owner: caller, vault-name: vault-name }
+      (merge vault { target-amount: new-target })
+    )
+    (ok new-target)
+  )
+)
+
+(define-public (extend-vault-lock (vault-name (string-ascii 50)) (additional-blocks uint))
+  (let (
+    (caller tx-sender)
+    (vault (unwrap! (map-get? savings-vaults { owner: caller, vault-name: vault-name }) ERR_VAULT_NOT_FOUND))
+    (current-unlock (get unlock-block vault))
+  )
+    (asserts! (> additional-blocks u0) ERR_INVALID_TIME_WINDOW)
+    (asserts! (get is-locked vault) ERR_VAULT_NOT_FOUND)
+    (map-set savings-vaults
+      { owner: caller, vault-name: vault-name }
+      (merge vault { unlock-block: (+ current-unlock additional-blocks) })
+    )
+    (ok (+ current-unlock additional-blocks))
   )
 )
