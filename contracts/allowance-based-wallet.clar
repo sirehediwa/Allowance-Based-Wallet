@@ -40,6 +40,14 @@
   { amount: uint }
 )
 
+(define-map allowance-expiries
+  {
+    owner: principal,
+    spender: principal
+  }
+  { expires-at: uint }
+)
+
 (define-map wallet-metadata
   { owner: principal }
   {
@@ -118,9 +126,26 @@
 )
 
 (define-read-only (get-allowance (owner principal) (spender principal))
-  (match (map-get? allowances { owner: owner, spender: spender })
-    allowance (ok (get amount allowance))
-    (ok u0)
+  (let (
+    (allowance-opt (map-get? allowances { owner: owner, spender: spender }))
+    (expiry-opt (map-get? allowance-expiries { owner: owner, spender: spender }))
+    (now stacks-block-height)
+  )
+    (match allowance-opt
+      allowance
+      (match expiry-opt
+        expiry (if (> (get expires-at expiry) now) (ok (get amount allowance)) (ok u0))
+        (ok (get amount allowance))
+      )
+      (ok u0)
+    )
+  )
+)
+
+(define-read-only (get-allowance-expiry (owner principal) (spender principal))
+  (match (map-get? allowance-expiries { owner: owner, spender: spender })
+    expiry (ok (some (get expires-at expiry)))
+    (ok none)
   )
 )
 
@@ -322,6 +347,12 @@
     (owner-balance (get balance owner-wallet))
     (owner-metadata (unwrap! (map-get? wallet-metadata { owner: owner }) ERR_WALLET_NOT_FOUND))
   )
+    (let ((expiry-opt (map-get? allowance-expiries { owner: owner, spender: spender })))
+      (match expiry-opt
+        expiry (asserts! (> (get expires-at expiry) stacks-block-height) ERR_INSUFFICIENT_ALLOWANCE)
+        true
+      )
+    )
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     (asserts! (get is-active owner-wallet) ERR_UNAUTHORIZED)
     (asserts! (>= allowance-amount amount) ERR_INSUFFICIENT_ALLOWANCE)
@@ -361,6 +392,26 @@
       })
     )
     (ok amount)
+  )
+)
+
+(define-public (set-allowance-expiry (spender principal) (expiry-block uint))
+  (let (
+    (caller tx-sender)
+  )
+    (asserts! (> expiry-block stacks-block-height) ERR_INVALID_TIME_WINDOW)
+    (map-set allowance-expiries
+      { owner: caller, spender: spender }
+      { expires-at: expiry-block }
+    )
+    (ok expiry-block)
+  )
+)
+
+(define-public (clear-allowance-expiry (spender principal))
+  (let ((caller tx-sender))
+    (map-delete allowance-expiries { owner: caller, spender: spender })
+    (ok true)
   )
 )
 
